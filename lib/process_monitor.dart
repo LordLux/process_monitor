@@ -97,6 +97,39 @@ class ProcessEvent {
   }
 }
 
+/// Configuration for monitoring a specific process
+class ProcessConfig {
+  /// The name of the process to monitor (e.g., 'notepad.exe')
+  final String processName;
+  
+  /// Callback called when the process starts
+  final void Function(ProcessEvent event)? onStart;
+  
+  /// Callback called when the process stops
+  final void Function(ProcessEvent event)? onStop;
+  
+  /// Whether to call onStart callback for multiple instances of the same process
+  /// If false, onStart is only called for the first instance
+  final bool allowMultipleStartCallbacks;
+  
+  /// Whether to call onStop callback for multiple instances of the same process
+  /// If false, onStop is only called when the last instance stops
+  final bool allowMultipleStopCallbacks;
+
+  ProcessConfig({
+    required this.processName,
+    this.onStart,
+    this.onStop,
+    this.allowMultipleStartCallbacks = true,
+    this.allowMultipleStopCallbacks = true,
+  });
+
+  @override
+  String toString() {
+    return 'ProcessConfig(processName: $processName, allowMultipleStart: $allowMultipleStartCallbacks, allowMultipleStop: $allowMultipleStopCallbacks)';
+  }
+}
+
 class ProcessMonitor {
   static ProcessMonitor? _instance;
   static ProcessMonitor get instance => _instance ??= ProcessMonitor._();
@@ -122,6 +155,14 @@ class ProcessMonitor {
   bool _isInitialized = false;
   Isolate? _backgroundIsolate;
   ReceivePort? _receivePort;
+
+  // New fields for process-specific monitoring
+  List<ProcessConfig>? _processConfigs;
+  final Map<String, Set<int>> _runningProcesses = {}; // processName -> Set of PIDs
+  
+  // Deduplication mechanism for events
+  final Set<String> _recentEvents = {}; // Store recent event signatures to detect duplicates
+  static const int _eventDeduplicationWindowMs = 100; // 100ms window for deduplication
 
   Stream<ProcessEvent> get events => _eventController.stream;
   Stream<ProcessEvent> get processEvents => _eventController.stream; // Alias for compatibility
@@ -227,6 +268,154 @@ class ProcessMonitor {
     return true;
   }
 
+  /// Start monitoring specific processes with individual callbacks
+  /// 
+  /// [processConfigs] - List of process configurations specifying which processes
+  ///                   to monitor and their respective callbacks
+  /// 
+  /// Returns true if monitoring started successfully
+  Future<bool> startMonitoringProcesses(List<ProcessConfig> processConfigs) async {
+    if (kDebugMode) {
+      print('[DEBUG] ProcessMonitor.startMonitoringProcesses() called with ${processConfigs.length} processes');
+      for (final config in processConfigs) {
+        print('[DEBUG] - Monitoring: ${config.processName}');
+      }
+    }
+
+    if (processConfigs.isEmpty) {
+      if (kDebugMode) {
+        print('[ERROR] No process configurations provided');
+      }
+      return false;
+    }
+
+    // Store process configurations
+    _processConfigs = processConfigs;
+    _runningProcesses.clear();
+
+    // Initialize all process sets
+    for (final config in processConfigs) {
+      _runningProcesses[config.processName] = <int>{};
+    }
+
+    // Start general monitoring first
+    final success = await startMonitoring();
+    if (!success) {
+      _processConfigs = null;
+      _runningProcesses.clear();
+      return false;
+    }
+
+    // Set up event filtering and callback routing
+    _setupProcessSpecificEventHandling();
+
+    return true;
+  }
+
+  void _setupProcessSpecificEventHandling() {
+    if (_processConfigs == null) return;
+
+    if (kDebugMode) {
+      print('[DEBUG] Setting up process-specific event handling for ${_processConfigs!.length} processes');
+    }
+  }
+
+  void _cleanupOldEventSignatures() {
+    // In a production app, you might want to implement time-based cleanup
+    // For now, just limit the size to prevent memory leaks
+    if (_recentEvents.length > 1000) {
+      // Remove half of the entries (oldest ones)
+      final signatures = _recentEvents.toList();
+      _recentEvents.clear();
+      // Add back the more recent half
+      _recentEvents.addAll(signatures.sublist(signatures.length ~/ 2));
+    }
+  }
+
+  void _handleProcessSpecificEvent(ProcessEvent event) {
+    if (_processConfigs == null) return;
+
+    if (kDebugMode) {
+      print('[DEBUG] _handleProcessSpecificEvent called for ${event.processName} ${event.eventType} PID:${event.processId}');
+    }
+
+    // Find the process config for this event
+    ProcessConfig? config;
+    for (final processConfig in _processConfigs!) {
+      if (processConfig.processName.toLowerCase() == event.processName.toLowerCase()) {
+        config = processConfig;
+        break;
+      }
+    }
+
+    if (config == null) {
+      // Process not in our monitoring list, ignore
+      if (kDebugMode) {
+        print('[DEBUG] Process ${event.processName} not in monitoring list, ignoring');
+      }
+      return;
+    }
+
+    final processName = config.processName;
+    final processInstances = _runningProcesses[processName]!;
+
+    if (event.eventType == 'start') {
+      final wasEmpty = processInstances.isEmpty;
+      processInstances.add(event.processId);
+
+      if (kDebugMode) {
+        print('[DEBUG] Process start: ${event.processName} PID:${event.processId}, wasEmpty:$wasEmpty, allowMultiple:${config.allowMultipleStartCallbacks}');
+      }
+
+      // Call start callback based on configuration
+      if (config.onStart != null) {
+        if (config.allowMultipleStartCallbacks || wasEmpty) {
+          try {
+            if (kDebugMode) {
+              print('[DEBUG] Calling onStart callback for ${event.processName} (PID: ${event.processId})');
+            }
+            config.onStart!(event);
+          } catch (e) {
+            if (kDebugMode) {
+              print('[ERROR] Error in onStart callback for ${event.processName}: $e');
+            }
+          }
+        } else {
+          if (kDebugMode) {
+            print('[DEBUG] Skipped onStart callback for ${event.processName} (multiple instances not allowed, instances: ${processInstances.length})');
+          }
+        }
+      }
+    } else if (event.eventType == 'stop') {
+      processInstances.remove(event.processId);
+      final isEmpty = processInstances.isEmpty;
+
+      if (kDebugMode) {
+        print('[DEBUG] Process stop: ${event.processName} PID:${event.processId}, isEmpty:$isEmpty, allowMultiple:${config.allowMultipleStopCallbacks}');
+      }
+
+      // Call stop callback based on configuration
+      if (config.onStop != null) {
+        if (config.allowMultipleStopCallbacks || isEmpty) {
+          try {
+            if (kDebugMode) {
+              print('[DEBUG] Calling onStop callback for ${event.processName} (PID: ${event.processId})');
+            }
+            config.onStop!(event);
+          } catch (e) {
+            if (kDebugMode) {
+              print('[ERROR] Error in onStop callback for ${event.processName}: $e');
+            }
+          }
+        } else {
+          if (kDebugMode) {
+            print('[DEBUG] Skipped onStop callback for ${event.processName} (multiple instances not allowed, remaining instances: ${processInstances.length})');
+          }
+        }
+      }
+    }
+  }
+
   Future<void> _startBackgroundEventLoop() async {
     if (kDebugMode) {
       print('[DEBUG] Starting background event loop in isolate');
@@ -246,6 +435,27 @@ class ProcessMonitor {
             timestamp: DateTime.fromMillisecondsSinceEpoch(data['timestampMs'] as int),
           );
           
+          // Create a unique signature for this event
+          final eventSignature = '${event.eventType}-${event.processName}-${event.processId}-${event.timestamp.millisecondsSinceEpoch ~/ 1000}'; // Round to nearest second
+          
+          // Check for duplicate events within the deduplication window
+          if (_recentEvents.contains(eventSignature)) {
+            if (kDebugMode) {
+              print('[DEBUG] Duplicate event detected and ignored: ${event.eventType} - ${event.processName} (${event.processId})');
+            }
+            return;
+          }
+          
+          // Add to recent events and clean up old entries
+          _recentEvents.add(eventSignature);
+          _cleanupOldEventSignatures();
+          
+          // Handle process-specific callbacks if configured (only once)
+          if (_processConfigs != null) {
+            _handleProcessSpecificEvent(event);
+          }
+          
+          // Always add to the general event stream for backward compatibility
           if (!_eventController.isClosed) {
             _eventController.add(event);
           }
@@ -404,6 +614,27 @@ class ProcessMonitor {
       ];
       
       for (final event in events) {
+        // Create a unique signature for this event
+        final eventSignature = '${event.eventType}-${event.processName}-${event.processId}-${event.timestamp.millisecondsSinceEpoch ~/ 1000}';
+        
+        // Check for duplicate events within the deduplication window
+        if (_recentEvents.contains(eventSignature)) {
+          if (kDebugMode) {
+            print('[DEBUG] Duplicate test event detected and ignored: ${event.eventType} - ${event.processName} (${event.processId})');
+          }
+          continue;
+        }
+        
+        // Add to recent events and clean up old entries
+        _recentEvents.add(eventSignature);
+        _cleanupOldEventSignatures();
+        
+        // Handle process-specific callbacks if configured
+        if (_processConfigs != null) {
+          _handleProcessSpecificEvent(event);
+        }
+        
+        // Always add to the general event stream for backward compatibility
         _eventController.add(event);
       }
     });
@@ -413,6 +644,11 @@ class ProcessMonitor {
     if (kDebugMode) {
       print('[DEBUG] ProcessMonitor.stopMonitoring() called');
     }
+    
+    // Clear process-specific configurations
+    _processConfigs = null;
+    _runningProcesses.clear();
+    _recentEvents.clear(); // Clear deduplication cache
     
     try {
       // Cancel timer immediately (fallback for polling mode)
@@ -475,6 +711,10 @@ class ProcessMonitor {
       if (kDebugMode) {
         print('[DEBUG] ProcessMonitor.dispose() called');
       }
+      
+      // Clear process-specific configurations
+      _processConfigs = null;
+      _runningProcesses.clear();
       
       // Stop monitoring immediately and synchronously
       if (isMonitoring) {
