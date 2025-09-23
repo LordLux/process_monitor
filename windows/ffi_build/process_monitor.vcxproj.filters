@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="M:\Projects\process_monitor\windows\ffi_build\process_monitor_api.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="M:\Projects\process_monitor\windows\ffi_build\process_monitor_api.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="M:\Projects\process_monitor\windows\ffi_build\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="M:\Projects\process_monitor\windows\ffi_build\process_monitor.def">
+      <Filter>Source Files</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{1B558E9E-C1A1-3530-A2B1-24BAA37669F2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{595C1A4F-06E7-30D4-AF63-390EA114F797}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

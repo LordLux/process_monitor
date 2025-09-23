@@ -1,0 +1,6 @@
+EXPORTS
+initialize_process_monitor
+start_monitoring
+stop_monitoring
+cleanup_process_monitor
+get_last_error

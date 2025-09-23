@@ -1,0 +1,3 @@
+M:/Projects/process_monitor/windows/ffi_build/CMakeFiles/process_monitor.dir
+M:/Projects/process_monitor/windows/ffi_build/CMakeFiles/ALL_BUILD.dir
+M:/Projects/process_monitor/windows/ffi_build/CMakeFiles/ZERO_CHECK.dir
