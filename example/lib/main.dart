@@ -1,13 +1,33 @@
+// ignore_for_file: avoid_print
+
 import 'package:flutter/material.dart';
 import 'package:process_monitor/process_monitor.dart';
+import 'package:window_manager/window_manager.dart';
 import 'dart:async';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await windowManager.ensureInitialized();
+
+  WindowOptions windowOptions = WindowOptions(
+    size: Size(1100, 850),
+    center: true,
+    backgroundColor: Colors.transparent,
+    skipTaskbar: false,
+    title: "Process Monitor FFI Test",
+    titleBarStyle: TitleBarStyle.hidden,
+    windowButtonVisibility: false, //
+  );
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
+
   runApp(const MyApp());
 }
 
 class MyApp extends StatefulWidget {
-  const MyApp({Key? key}) : super(key: key);
+  const MyApp({super.key});
 
   @override
   State<MyApp> createState() => _MyAppState();
@@ -25,7 +45,6 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
-    // Don't auto start - let user click button to test
   }
 
   void _startMonitoring() async {
@@ -39,7 +58,7 @@ class _MyAppState extends State<MyApp> {
       print('[DEBUG] Calling ProcessMonitor.startMonitoring()');
       bool success = await _processMonitor.startMonitoring();
       print('[DEBUG] ProcessMonitor.startMonitoring() returned: $success');
-      
+
       if (success) {
         setState(() {
           _status = 'Running (FFI)';
@@ -50,12 +69,12 @@ class _MyAppState extends State<MyApp> {
           (ProcessEvent event) {
             setState(() {
               _events.insert(0, event); // Add to beginning for newest first
-              
+
               // Keep only last 50 events to prevent memory issues
               if (_events.length > 50) {
                 _events.removeRange(50, _events.length);
               }
-              
+
               // Update counters
               if (event.eventType == 'start') {
                 _startEvents++;
@@ -93,32 +112,35 @@ class _MyAppState extends State<MyApp> {
     setState(() {
       _status = 'Stopping...';
     });
-    
+
     try {
       // Cancel the subscription first (immediate)
       print('[DEBUG] Cancelling subscription');
       _subscription?.cancel();
       _subscription = null;
-      
+
       // Stop monitoring (now just sets a flag, very fast)
       print('[DEBUG] Calling ProcessMonitor.stopMonitoring()');
-      _processMonitor.stopMonitoring().then((success) {
-        print('[DEBUG] ProcessMonitor.stopMonitoring() returned: $success');
-        if (mounted) {
-          setState(() {
-            _status = success ? 'Stopped' : 'Error stopping';
-            _errorMessage = success ? '' : 'Failed to stop monitoring';
+      _processMonitor
+          .stopMonitoring()
+          .then((success) {
+            print('[DEBUG] ProcessMonitor.stopMonitoring() returned: $success');
+            if (mounted) {
+              setState(() {
+                _status = success ? 'Stopped' : 'Error stopping';
+                _errorMessage = success ? '' : 'Failed to stop monitoring';
+              });
+            }
+          })
+          .catchError((e) {
+            print('[ERROR] Exception in stopMonitoring().then: $e');
+            if (mounted) {
+              setState(() {
+                _status = 'Error stopping';
+                _errorMessage = e.toString();
+              });
+            }
           });
-        }
-      }).catchError((e) {
-        print('[ERROR] Exception in stopMonitoring().then: $e');
-        if (mounted) {
-          setState(() {
-            _status = 'Error stopping';
-            _errorMessage = e.toString();
-          });
-        }
-      });
     } catch (e) {
       print('[ERROR] Exception in _stopMonitoring: $e');
       setState(() {
@@ -146,13 +168,25 @@ class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
       title: 'Process Monitor FFI Test',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-      ),
+      theme: ThemeData(primarySwatch: Colors.blue),
       home: Scaffold(
         appBar: AppBar(
           title: const Text('Process Monitor FFI Test'),
+          actions: [
+            const Text('Process Monitor FFI Test'),
+            Spacer(),
+            IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: () async {
+                print('[DEBUG] Close button pressed');
+                _subscription?.cancel();
+                await _processMonitor.dispose();
+                windowManager.close();
+              },
+            ),
+          ],
         ),
         body: Padding(
           padding: const EdgeInsets.all(16.0),
@@ -165,34 +199,16 @@ class _MyAppState extends State<MyApp> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'Status: $_status',
-                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                      ),
-                      if (_errorMessage.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          'Error: $_errorMessage',
-                          style: const TextStyle(color: Colors.red),
-                        ),
-                      ],
+                      Text('Status: $_status', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      if (_errorMessage.isNotEmpty) ...[const SizedBox(height: 8), Text('Error: $_errorMessage', style: const TextStyle(color: Colors.red))],
                       const SizedBox(height: 16),
                       Row(
                         children: [
-                          ElevatedButton(
-                            onPressed: _processMonitor.isMonitoring ? null : _startMonitoring,
-                            child: const Text('Start Monitoring'),
-                          ),
+                          ElevatedButton(onPressed: _processMonitor.isMonitoring ? null : _startMonitoring, child: const Text('Start Monitoring')),
                           const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: !_processMonitor.isMonitoring ? null : _stopMonitoring,
-                            child: const Text('Stop Monitoring'),
-                          ),
+                          ElevatedButton(onPressed: !_processMonitor.isMonitoring ? null : _stopMonitoring, child: const Text('Stop Monitoring')),
                           const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: _clearEvents,
-                            child: const Text('Clear'),
-                          ),
+                          ElevatedButton(onPressed: _clearEvents, child: const Text('Clear')),
                         ],
                       ),
                     ],
@@ -245,10 +261,7 @@ class _MyAppState extends State<MyApp> {
                     children: [
                       const Padding(
                         padding: EdgeInsets.all(16.0),
-                        child: Text(
-                          'Recent Process Events',
-                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                        ),
+                        child: Text('Recent Process Events', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                       ),
                       Expanded(
                         child: _events.isEmpty
@@ -258,10 +271,7 @@ class _MyAppState extends State<MyApp> {
                                 itemBuilder: (context, index) {
                                   final event = _events[index];
                                   return ListTile(
-                                    leading: Icon(
-                                      event.eventType == 'start' ? Icons.play_arrow : Icons.stop,
-                                      color: event.eventType == 'start' ? Colors.green : Colors.red,
-                                    ),
+                                    leading: Icon(event.eventType == 'start' ? Icons.play_arrow : Icons.stop, color: event.eventType == 'start' ? Colors.green : Colors.red),
                                     title: Text(event.processName),
                                     subtitle: Text('PID: ${event.processId} • ${event.timestamp.toString().substring(11, 19)}'),
                                     trailing: Text(event.eventType.toUpperCase()),
