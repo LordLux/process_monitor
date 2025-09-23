@@ -29,11 +29,20 @@ typedef void (*ProcessEventCallback)(const ProcessEventData* event_data, void* u
 // Initialize the process monitor
 PROCESS_MONITOR_API bool initialize_process_monitor();
 
-// Start monitoring processes with a callback
-PROCESS_MONITOR_API bool start_monitoring(ProcessEventCallback callback, void* user_data);
+// Start monitoring processes (polling mode)
+PROCESS_MONITOR_API bool start_monitoring();
 
 // Stop monitoring processes
 PROCESS_MONITOR_API bool stop_monitoring();
+
+// Get the next available process event (returns false if no events)
+PROCESS_MONITOR_API bool get_next_event(ProcessEventData* event_data);
+
+// Check if monitoring is currently active
+PROCESS_MONITOR_API bool is_monitoring();
+
+// Get count of pending events in queue
+PROCESS_MONITOR_API int get_pending_event_count();
 
 // Cleanup and release resources
 PROCESS_MONITOR_API void cleanup_process_monitor();

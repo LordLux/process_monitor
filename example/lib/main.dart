@@ -18,55 +18,114 @@ class _MyAppState extends State<MyApp> {
   final List<ProcessEvent> _events = [];
   StreamSubscription<ProcessEvent>? _subscription;
   String _status = 'Stopped';
+  String _errorMessage = '';
   int _startEvents = 0;
   int _stopEvents = 0;
 
   @override
   void initState() {
     super.initState();
-    _startMonitoring();
+    // Don't auto start - let user click button to test
   }
 
-  void _startMonitoring() {
+  void _startMonitoring() async {
     setState(() {
       _status = 'Starting...';
+      _errorMessage = '';
     });
 
-    _subscription = _processMonitor.processEvents.listen(
-      (ProcessEvent event) {
+    try {
+      // Start monitoring with FFI
+      print('[DEBUG] Calling ProcessMonitor.startMonitoring()');
+      bool success = await _processMonitor.startMonitoring();
+      print('[DEBUG] ProcessMonitor.startMonitoring() returned: $success');
+      
+      if (success) {
         setState(() {
-          _events.insert(0, event); // Add to beginning for newest first
-          
-          // Keep only last 100 events to prevent memory issues
-          if (_events.length > 100) {
-            _events.removeRange(100, _events.length);
-          }
-          
-          // Update counters
-          if (event.eventType == 'start') {
-            _startEvents++;
-          } else if (event.eventType == 'stop') {
-            _stopEvents++;
-          }
-          
-          _status = 'Monitoring';
+          _status = 'Running (FFI)';
         });
-      },
-      onError: (error) {
+
+        print('[DEBUG] Setting up event subscription');
+        _subscription = _processMonitor.processEvents.listen(
+          (ProcessEvent event) {
+            setState(() {
+              _events.insert(0, event); // Add to beginning for newest first
+              
+              // Keep only last 50 events to prevent memory issues
+              if (_events.length > 50) {
+                _events.removeRange(50, _events.length);
+              }
+              
+              // Update counters
+              if (event.eventType == 'start') {
+                _startEvents++;
+              } else if (event.eventType == 'stop') {
+                _stopEvents++;
+              }
+            });
+          },
+          onError: (error) {
+            print('[ERROR] Event stream error: $error');
+            setState(() {
+              _status = 'Error';
+              _errorMessage = error.toString();
+            });
+          },
+        );
+        print('[DEBUG] Event subscription set up successfully');
+      } else {
         setState(() {
-          _status = 'Error: $error';
+          _status = 'Failed to start';
+          _errorMessage = 'Failed to start process monitoring';
         });
-        print('Process monitor error: $error');
-      },
-    );
+      }
+    } catch (e) {
+      print('[ERROR] Exception in _startMonitoring: $e');
+      setState(() {
+        _status = 'Error';
+        _errorMessage = e.toString();
+      });
+    }
   }
 
   void _stopMonitoring() {
-    _subscription?.cancel();
-    _subscription = null;
+    print('[DEBUG] _stopMonitoring() button pressed');
     setState(() {
-      _status = 'Stopped';
+      _status = 'Stopping...';
     });
+    
+    try {
+      // Cancel the subscription first (immediate)
+      print('[DEBUG] Cancelling subscription');
+      _subscription?.cancel();
+      _subscription = null;
+      
+      // Stop monitoring (now just sets a flag, very fast)
+      print('[DEBUG] Calling ProcessMonitor.stopMonitoring()');
+      _processMonitor.stopMonitoring().then((success) {
+        print('[DEBUG] ProcessMonitor.stopMonitoring() returned: $success');
+        if (mounted) {
+          setState(() {
+            _status = success ? 'Stopped' : 'Error stopping';
+            _errorMessage = success ? '' : 'Failed to stop monitoring';
+          });
+        }
+      }).catchError((e) {
+        print('[ERROR] Exception in stopMonitoring().then: $e');
+        if (mounted) {
+          setState(() {
+            _status = 'Error stopping';
+            _errorMessage = e.toString();
+          });
+        }
+      });
+    } catch (e) {
+      print('[ERROR] Exception in _stopMonitoring: $e');
+      setState(() {
+        _status = 'Error stopping';
+        _errorMessage = e.toString();
+      });
+    }
   }
 
   void _clearEvents() {
@@ -84,140 +143,138 @@ class _MyAppState extends State<MyApp> {
     super.dispose();
   }
 
-  Widget _buildEventTile(ProcessEvent event) {
-    IconData icon;
-    Color color;
-    
-    switch (event.eventType) {
-      case 'start':
-        icon = Icons.play_arrow;
-        color = Colors.green;
-        break;
-      case 'stop':
-        icon = Icons.stop;
-        color = Colors.red;
-        break;
-      default:
-        icon = Icons.error;
-        color = Colors.orange;
-    }
-
-    return ListTile(
-      leading: Icon(icon, color: color),
-      title: Text(event.processName),
-      subtitle: Text('PID: ${event.processId}'),
-      trailing: Text(
-        '${event.timestamp.hour.toString().padLeft(2, '0')}:'
-        '${event.timestamp.minute.toString().padLeft(2, '0')}:'
-        '${event.timestamp.second.toString().padLeft(2, '0')}',
-        style: const TextStyle(fontSize: 12),
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Process Monitor',
+      title: 'Process Monitor FFI Test',
       theme: ThemeData(
         primarySwatch: Colors.blue,
-        visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: Scaffold(
         appBar: AppBar(
-          title: const Text('Process Monitor'),
-          backgroundColor: Colors.blue,
-          foregroundColor: Colors.white,
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.clear),
-              onPressed: _clearEvents,
-              tooltip: 'Clear events',
-            ),
-          ],
+          title: const Text('Process Monitor FFI Test'),
         ),
-        body: Column(
-          children: [
-            // Status bar
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(16.0),
-              color: _status == 'Monitoring' 
-                  ? Colors.green.shade100 
-                  : _status.startsWith('Error')
-                      ? Colors.red.shade100
-                      : Colors.grey.shade100,
-              child: Column(
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        body: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            children: [
+              // Status and controls
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
                         'Status: $_status',
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      if (_errorMessage.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Error: $_errorMessage',
+                          style: const TextStyle(color: Colors.red),
                         ),
-                      ),
-                      Text(
-                        'Events: ${_events.length}',
-                        style: const TextStyle(fontSize: 14),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      Chip(
-                        avatar: const Icon(Icons.play_arrow, size: 16, color: Colors.green),
-                        label: Text('Started: $_startEvents'),
-                        backgroundColor: Colors.green.shade50,
-                      ),
-                      Chip(
-                        avatar: const Icon(Icons.stop, size: 16, color: Colors.red),
-                        label: Text('Stopped: $_stopEvents'),
-                        backgroundColor: Colors.red.shade50,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            // Events list
-            Expanded(
-              child: _events.isEmpty
-                  ? const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
+                      ],
+                      const SizedBox(height: 16),
+                      Row(
                         children: [
-                          Icon(Icons.hourglass_empty, size: 64, color: Colors.grey),
-                          SizedBox(height: 16),
-                          Text(
-                            'No process events yet...',
-                            style: TextStyle(fontSize: 18, color: Colors.grey),
+                          ElevatedButton(
+                            onPressed: _processMonitor.isMonitoring ? null : _startMonitoring,
+                            child: const Text('Start Monitoring'),
                           ),
-                          SizedBox(height: 8),
-                          Text(
-                            'Try starting or stopping applications to see events',
-                            style: TextStyle(fontSize: 14, color: Colors.grey),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            onPressed: !_processMonitor.isMonitoring ? null : _stopMonitoring,
+                            child: const Text('Stop Monitoring'),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            onPressed: _clearEvents,
+                            child: const Text('Clear'),
                           ),
                         ],
                       ),
-                    )
-                  : ListView.builder(
-                      itemCount: _events.length,
-                      itemBuilder: (context, index) {
-                        return _buildEventTile(_events[index]);
-                      },
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              // Statistics
+              Row(
+                children: [
+                  Expanded(
+                    child: Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          children: [
+                            const Text('Started'),
+                            Text(
+                              '$_startEvents',
+                              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.green),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
-            ),
-          ],
-        ),
-        floatingActionButton: FloatingActionButton(
-          onPressed: _subscription == null ? _startMonitoring : _stopMonitoring,
-          tooltip: _subscription == null ? 'Start Monitoring' : 'Stop Monitoring',
-          child: Icon(_subscription == null ? Icons.play_arrow : Icons.stop),
+                  ),
+                  Expanded(
+                    child: Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          children: [
+                            const Text('Stopped'),
+                            Text(
+                              '$_stopEvents',
+                              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.red),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              // Events list
+              Expanded(
+                child: Card(
+                  child: Column(
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.all(16.0),
+                        child: Text(
+                          'Recent Process Events',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      Expanded(
+                        child: _events.isEmpty
+                            ? const Center(child: Text('No events yet'))
+                            : ListView.builder(
+                                itemCount: _events.length,
+                                itemBuilder: (context, index) {
+                                  final event = _events[index];
+                                  return ListTile(
+                                    leading: Icon(
+                                      event.eventType == 'start' ? Icons.play_arrow : Icons.stop,
+                                      color: event.eventType == 'start' ? Colors.green : Colors.red,
+                                    ),
+                                    title: Text(event.processName),
+                                    subtitle: Text('PID: ${event.processId} • ${event.timestamp.toString().substring(11, 19)}'),
+                                    trailing: Text(event.eventType.toUpperCase()),
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -3,21 +3,21 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <chrono>
 
 #define _WIN32_DCOM
 #include <Wbemidl.h>
 #include <windows.h>
+#include <atlbase.h>
 #include <comdef.h>
 
 // Global state for FFI
 static std::string g_last_error;
 static std::atomic<bool> g_monitoring = false;
 static std::thread g_monitor_thread;
-static std::queue<ProcessEventData> g_event_queue;
-static std::mutex g_queue_mutex;
-static std::atomic<bool> g_com_initialized = false;
+static ProcessEventCallback g_callback = nullptr;
+static void* g_user_data = nullptr;
+static std::mutex g_callback_mutex;
 
 // Forward declaration
 class FFIProcessEventSink;
@@ -33,10 +33,7 @@ private:
 
 public:
     FFIProcessEventSink() : m_lRef(0) {}
-    virtual ~FFIProcessEventSink() { 
-        // Don't call Cleanup() in destructor - this can cause crashes
-        // We'll call it explicitly when safe
-    }
+    virtual ~FFIProcessEventSink() { Cleanup(); }
 
     // IUnknown methods
     ULONG STDMETHODCALLTYPE AddRef()
@@ -66,6 +63,10 @@ public:
     // IWbemObjectSink methods
     HRESULT STDMETHODCALLTYPE Indicate(LONG lObjectCount, IWbemClassObject **apObjArray)
     {
+        std::lock_guard<std::mutex> lock(g_callback_mutex);
+        
+        if (!g_callback) return WBEM_S_NO_ERROR;
+
         for (long i = 0; i < lObjectCount; i++)
         {
             VARIANT vtProp;
@@ -100,8 +101,8 @@ public:
                 strncpy_s(event_data.process_name, sizeof(event_data.process_name), utf8_processName.c_str(), _TRUNCATE);
                 event_data.process_id = (int)processId;
                 
-                // Use system clock to get proper Unix epoch timestamp
-                auto now = std::chrono::system_clock::now();
+                // Use high resolution timestamp
+                auto now = std::chrono::high_resolution_clock::now();
                 auto duration = now.time_since_epoch();
                 auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
                 event_data.timestamp_ms = millis;
@@ -111,16 +112,8 @@ public:
                 else
                     strncpy_s(event_data.event_type, sizeof(event_data.event_type), "stop", _TRUNCATE);
 
-                // Add to queue instead of calling callback
-                {
-                    std::lock_guard<std::mutex> lock(g_queue_mutex);
-                    g_event_queue.push(event_data);
-                    
-                    // Limit queue size to prevent memory issues
-                    while (g_event_queue.size() > 1000) {
-                        g_event_queue.pop();
-                    }
-                }
+                // Call the user callback
+                g_callback(&event_data, g_user_data);
 
                 VariantClear(&vtProcessName);
                 VariantClear(&vtProcessId);
@@ -142,22 +135,19 @@ public:
     {
         HRESULT hres;
 
-        // Only initialize COM if it hasn't been initialized yet
-        if (!g_com_initialized.exchange(true)) {
-            hres = CoInitializeEx(0, COINIT_MULTITHREADED);
-            if (FAILED(hres) && hres != RPC_E_CHANGED_MODE)
-            {
-                g_com_initialized = false;
-                g_last_error = "Failed to initialize COM library. Error code = 0x" + std::to_string(hres);
-                return false;
-            }
+        hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+        if (FAILED(hres))
+        {
+            g_last_error = "Failed to initialize COM library. Error code = 0x" + std::to_string(hres);
+            return false;
+        }
 
-            hres = CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE, NULL);
-            if (FAILED(hres) && hres != RPC_E_TOO_LATE)
-            {
-                g_last_error = "Failed to initialize security. Error code = 0x" + std::to_string(hres);
-                // Don't fail completely on security init failure
-            }
+        hres = CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE, NULL);
+        if (FAILED(hres))
+        {
+            CoUninitialize();
+            g_last_error = "Failed to initialize security. Error code = 0x" + std::to_string(hres);
+            return false;
         }
 
         IWbemLocator *pLoc = NULL;
@@ -272,11 +262,11 @@ void monitor_thread_function()
     // Keep the thread alive while monitoring
     while (g_monitoring)
     {
-        Sleep(50); // Sleep for 50ms - more responsive to stop signal
+        Sleep(100); // Sleep for 100ms
     }
 
-    // DO NOT call Cleanup() here - this causes crashes
-    // Just set the pointer to nullptr - cleanup will happen in cleanup_process_monitor()
+    // Cleanup
+    delete g_event_sink;
     g_event_sink = nullptr;
 }
 
@@ -289,7 +279,7 @@ PROCESS_MONITOR_API bool initialize_process_monitor()
     return true;
 }
 
-PROCESS_MONITOR_API bool start_monitoring()
+PROCESS_MONITOR_API bool start_monitoring(ProcessEventCallback callback, void* user_data)
 {
     if (g_monitoring)
     {
@@ -297,128 +287,47 @@ PROCESS_MONITOR_API bool start_monitoring()
         return false;
     }
 
-    // Clear any existing events
+    if (!callback)
     {
-        std::lock_guard<std::mutex> lock(g_queue_mutex);
-        while (!g_event_queue.empty()) {
-            g_event_queue.pop();
-        }
-    }
-
-    g_monitoring = true;
-
-    // Wait for any previous thread to finish
-    if (g_monitor_thread.joinable()) {
-        g_monitor_thread.join();
-    }
-
-    // Start the monitoring thread
-    try {
-        g_monitor_thread = std::thread(monitor_thread_function);
-    }
-    catch (...) {
-        g_monitoring = false;
-        g_last_error = "Failed to start monitoring thread";
+        g_last_error = "Callback function cannot be null";
         return false;
     }
+
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    g_callback = callback;
+    g_user_data = user_data;
+    g_monitoring = true;
+
+    // Start the monitoring thread
+    g_monitor_thread = std::thread(monitor_thread_function);
 
     return true;
 }
 
 PROCESS_MONITOR_API bool stop_monitoring()
 {
-    // Simply set the flag - no blocking operations at all
-    g_monitoring = false;
-    return true;
-}
-
-PROCESS_MONITOR_API bool get_next_event(ProcessEventData* event_data)
-{
-    if (!event_data) return false;
-
-    std::lock_guard<std::mutex> lock(g_queue_mutex);
-    if (g_event_queue.empty()) {
-        return false;
+    if (!g_monitoring)
+    {
+        return true; // Already stopped
     }
 
-    *event_data = g_event_queue.front();
-    g_event_queue.pop();
+    g_monitoring = false;
+
+    if (g_monitor_thread.joinable())
+    {
+        g_monitor_thread.join();
+    }
+
+    std::lock_guard<std::mutex> lock(g_callback_mutex);
+    g_callback = nullptr;
+    g_user_data = nullptr;
+
     return true;
-}
-
-PROCESS_MONITOR_API bool is_monitoring()
-{
-    return g_monitoring;
-}
-
-PROCESS_MONITOR_API int get_pending_event_count()
-{
-    std::lock_guard<std::mutex> lock(g_queue_mutex);
-    return (int)g_event_queue.size();
 }
 
 PROCESS_MONITOR_API void cleanup_process_monitor()
 {
-    // Stop monitoring first (non-blocking)
-    if (g_monitoring) {
-        g_monitoring = false;
-    }
-    
-    // Wait for thread to finish safely
-    if (g_monitor_thread.joinable()) {
-        try {
-            // Give thread time to see the stop signal
-            Sleep(100);
-            
-            // Try to join with timeout
-            auto start_time = GetTickCount64();
-            while (g_monitor_thread.joinable() && (GetTickCount64() - start_time) < 1000) {
-                Sleep(50);
-            }
-            
-            // If still running, detach it
-            if (g_monitor_thread.joinable()) {
-                g_monitor_thread.detach();
-            }
-        }
-        catch (...) {
-            // If anything fails, just detach
-            if (g_monitor_thread.joinable()) {
-                g_monitor_thread.detach();
-            }
-        }
-    }
-    
-    // Clean up any remaining event sink (if the thread didn't finish cleanly)
-    if (g_event_sink) {
-        try {
-            g_event_sink->Cleanup();
-            delete g_event_sink;
-        }
-        catch (...) {
-            // Ignore cleanup errors
-        }
-        g_event_sink = nullptr;
-    }
-    
-    // Clear the queue
-    {
-        std::lock_guard<std::mutex> lock(g_queue_mutex);
-        while (!g_event_queue.empty()) {
-            g_event_queue.pop();
-        }
-    }
-    
-    // Clean up COM if we initialized it
-    if (g_com_initialized.exchange(false)) {
-        try {
-            CoUninitialize();
-        }
-        catch (...) {
-            // Ignore COM cleanup errors
-        }
-    }
-    
+    stop_monitoring();
     g_last_error.clear();
 }
 

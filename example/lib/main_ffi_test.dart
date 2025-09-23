@@ -36,12 +36,16 @@ class _MyAppState extends State<MyApp> {
 
     try {
       // Start monitoring with FFI
+      print('[DEBUG] Calling ProcessMonitor.startMonitoring()');
       bool success = await _processMonitor.startMonitoring();
+      print('[DEBUG] ProcessMonitor.startMonitoring() returned: $success');
+      
       if (success) {
         setState(() {
           _status = 'Running (FFI)';
         });
 
+        print('[DEBUG] Setting up event subscription');
         _subscription = _processMonitor.processEvents.listen(
           (ProcessEvent event) {
             setState(() {
@@ -61,12 +65,14 @@ class _MyAppState extends State<MyApp> {
             });
           },
           onError: (error) {
+            print('[ERROR] Event stream error: $error');
             setState(() {
               _status = 'Error';
               _errorMessage = error.toString();
             });
           },
         );
+        print('[DEBUG] Event subscription set up successfully');
       } else {
         setState(() {
           _status = 'Failed to start';
@@ -74,6 +80,7 @@ class _MyAppState extends State<MyApp> {
         });
       }
     } catch (e) {
+      print('[ERROR] Exception in _startMonitoring: $e');
       setState(() {
         _status = 'Error';
         _errorMessage = e.toString();
@@ -81,19 +88,39 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  void _stopMonitoring() async {
+  void _stopMonitoring() {
+    print('[DEBUG] _stopMonitoring() button pressed');
     setState(() {
       _status = 'Stopping...';
     });
     
     try {
-      await _subscription?.cancel();
-      await _processMonitor.stopMonitoring();
-      setState(() {
-        _status = 'Stopped';
-        _errorMessage = '';
+      // Cancel the subscription first (immediate)
+      print('[DEBUG] Cancelling subscription');
+      _subscription?.cancel();
+      _subscription = null;
+      
+      // Stop monitoring (now just sets a flag, very fast)
+      print('[DEBUG] Calling ProcessMonitor.stopMonitoring()');
+      _processMonitor.stopMonitoring().then((success) {
+        print('[DEBUG] ProcessMonitor.stopMonitoring() returned: $success');
+        if (mounted) {
+          setState(() {
+            _status = success ? 'Stopped' : 'Error stopping';
+            _errorMessage = success ? '' : 'Failed to stop monitoring';
+          });
+        }
+      }).catchError((e) {
+        print('[ERROR] Exception in stopMonitoring().then: $e');
+        if (mounted) {
+          setState(() {
+            _status = 'Error stopping';
+            _errorMessage = e.toString();
+          });
+        }
       });
     } catch (e) {
+      print('[ERROR] Exception in _stopMonitoring: $e');
       setState(() {
         _status = 'Error stopping';
         _errorMessage = e.toString();
