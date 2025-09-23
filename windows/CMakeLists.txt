@@ -35,7 +35,7 @@ add_library(${PLUGIN_NAME} SHARED
 # Apply a standard set of build settings that are configured in the
 # application-level CMakeLists.txt. This can be removed for plugins that want
 # full control over build settings.
-apply_standard_settings(${PLUGIN_NAME})
+# apply_standard_settings(${PLUGIN_NAME})
 
 # Symbols are hidden by default to reduce the chance of accidental conflicts
 # between plugins. This should not be removed; any symbols that should be
@@ -56,6 +56,6 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
 # This list could contain prebuilt libraries, or libraries created by an
 # external build triggered from this build file.
 set(process_monitor_bundled_libraries
-  "${CMAKE_CURRENT_SOURCE_DIR}/ffi_build/Debug/process_monitor.dll"
+  "${CMAKE_CURRENT_SOURCE_DIR}/ffi_build/Release/process_monitor.dll"
   PARENT_SCOPE
 )

@@ -19,6 +19,13 @@ static std::queue<ProcessEventData> g_event_queue;
 static std::mutex g_queue_mutex;
 static std::atomic<bool> g_com_initialized = false;
 
+// Event signaling mechanism
+static HANDLE g_event_available = nullptr;
+
+// Callback mechanism (kept for compatibility)
+static ProcessEventCallback g_event_callback = nullptr;
+static void* g_callback_user_data = nullptr;
+
 // Forward declaration
 class FFIProcessEventSink;
 static FFIProcessEventSink* g_event_sink = nullptr;
@@ -111,7 +118,7 @@ public:
                 else
                     strncpy_s(event_data.event_type, sizeof(event_data.event_type), "stop", _TRUNCATE);
 
-                // Add to queue instead of calling callback
+                // Add to queue and signal event availability
                 {
                     std::lock_guard<std::mutex> lock(g_queue_mutex);
                     g_event_queue.push(event_data);
@@ -119,6 +126,21 @@ public:
                     // Limit queue size to prevent memory issues
                     while (g_event_queue.size() > 1000) {
                         g_event_queue.pop();
+                    }
+                }
+                
+                // Signal that new events are available
+                if (g_event_available != nullptr) {
+                    SetEvent(g_event_available);
+                }
+                
+                // If we have a callback, call it immediately (kept for compatibility)
+                if (g_event_callback != nullptr) {
+                    try {
+                        g_event_callback(&event_data, g_callback_user_data);
+                    }
+                    catch (...) {
+                        // Ignore callback errors to prevent crashes
                     }
                 }
 
@@ -297,6 +319,15 @@ PROCESS_MONITOR_API bool start_monitoring()
         return false;
     }
 
+    // Create event handle for signaling
+    if (g_event_available == nullptr) {
+        g_event_available = CreateEvent(nullptr, FALSE, FALSE, nullptr); // Auto-reset event
+        if (g_event_available == nullptr) {
+            g_last_error = "Failed to create event handle";
+            return false;
+        }
+    }
+
     // Clear any existing events
     {
         std::lock_guard<std::mutex> lock(g_queue_mutex);
@@ -325,10 +356,57 @@ PROCESS_MONITOR_API bool start_monitoring()
     return true;
 }
 
+PROCESS_MONITOR_API bool start_monitoring_with_callback(ProcessEventCallback callback, void* user_data)
+{
+    if (g_monitoring)
+    {
+        g_last_error = "Process monitor is already running";
+        return false;
+    }
+
+    // Set the callback
+    g_event_callback = callback;
+    g_callback_user_data = user_data;
+
+    // Clear any existing events
+    {
+        std::lock_guard<std::mutex> lock(g_queue_mutex);
+        while (!g_event_queue.empty()) {
+            g_event_queue.pop();
+        }
+    }
+
+    g_monitoring = true;
+
+    // Wait for any previous thread to finish
+    if (g_monitor_thread.joinable()) {
+        g_monitor_thread.join();
+    }
+
+    // Start the monitoring thread
+    try {
+        g_monitor_thread = std::thread(monitor_thread_function);
+    }
+    catch (...) {
+        g_monitoring = false;
+        g_event_callback = nullptr;
+        g_callback_user_data = nullptr;
+        g_last_error = "Failed to start monitoring thread";
+        return false;
+    }
+
+    return true;
+}
+
 PROCESS_MONITOR_API bool stop_monitoring()
 {
     // Simply set the flag - no blocking operations at all
     g_monitoring = false;
+    
+    // Clear callback
+    g_event_callback = nullptr;
+    g_callback_user_data = nullptr;
+    
     return true;
 }
 
@@ -357,69 +435,138 @@ PROCESS_MONITOR_API int get_pending_event_count()
     return (int)g_event_queue.size();
 }
 
+PROCESS_MONITOR_API int wait_for_events(int timeout_ms)
+{
+    if (g_event_available == nullptr) {
+        return -1; // Not initialized
+    }
+    
+    DWORD result = WaitForSingleObject(g_event_available, timeout_ms);
+    if (result == WAIT_OBJECT_0) {
+        // Event was signaled, return number of available events
+        std::lock_guard<std::mutex> lock(g_queue_mutex);
+        return (int)g_event_queue.size();
+    } else if (result == WAIT_TIMEOUT) {
+        return 0; // Timeout
+    } else {
+        return -1; // Error
+    }
+}
+
+PROCESS_MONITOR_API int get_all_events(ProcessEventData* events_array, int max_events)
+{
+    if (!events_array || max_events <= 0) {
+        return 0;
+    }
+    
+    std::lock_guard<std::mutex> lock(g_queue_mutex);
+    int count = 0;
+    
+    while (!g_event_queue.empty() && count < max_events) {
+        events_array[count] = g_event_queue.front();
+        g_event_queue.pop();
+        count++;
+    }
+    
+    return count;
+}
+
 PROCESS_MONITOR_API void cleanup_process_monitor()
 {
-    // Stop monitoring first (non-blocking)
-    if (g_monitoring) {
-        g_monitoring = false;
+    // Set flag to prevent any new operations
+    static std::atomic<bool> cleanup_in_progress{false};
+    if (cleanup_in_progress.exchange(true)) {
+        // Cleanup already in progress, don't do it again
+        return;
     }
     
-    // Wait for thread to finish safely
-    if (g_monitor_thread.joinable()) {
-        try {
-            // Give thread time to see the stop signal
-            Sleep(100);
-            
-            // Try to join with timeout
-            auto start_time = GetTickCount64();
-            while (g_monitor_thread.joinable() && (GetTickCount64() - start_time) < 1000) {
-                Sleep(50);
+    try {
+        // Stop monitoring first (non-blocking)
+        if (g_monitoring) {
+            g_monitoring = false;
+        }
+        
+        // Wait for thread to finish safely
+        if (g_monitor_thread.joinable()) {
+            try {
+                // Give thread time to see the stop signal
+                Sleep(100);
+                
+                // Try to join with timeout
+                auto start_time = GetTickCount64();
+                while (g_monitor_thread.joinable() && (GetTickCount64() - start_time) < 1000) {
+                    Sleep(50);
+                }
+                
+                // If still running, detach it (don't force terminate)
+                if (g_monitor_thread.joinable()) {
+                    g_monitor_thread.detach();
+                }
             }
-            
-            // If still running, detach it
-            if (g_monitor_thread.joinable()) {
-                g_monitor_thread.detach();
+            catch (...) {
+                // If anything fails, just detach safely
+                try {
+                    if (g_monitor_thread.joinable()) {
+                        g_monitor_thread.detach();
+                    }
+                }
+                catch (...) {
+                    // Ignore any detach errors
+                }
+            }
+        }
+        
+        // Clean up any remaining event sink (if the thread didn't finish cleanly)
+        if (g_event_sink) {
+            try {
+                g_event_sink->Cleanup();
+                delete g_event_sink;
+            }
+            catch (...) {
+                // Ignore cleanup errors - just set to null
+            }
+            g_event_sink = nullptr;
+        }
+        
+        // Clear the queue safely
+        try {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            while (!g_event_queue.empty()) {
+                g_event_queue.pop();
             }
         }
         catch (...) {
-            // If anything fails, just detach
-            if (g_monitor_thread.joinable()) {
-                g_monitor_thread.detach();
+            // Ignore queue cleanup errors
+        }
+        
+        // Clean up event handle
+        if (g_event_available != nullptr) {
+            try {
+                CloseHandle(g_event_available);
+            }
+            catch (...) {
+                // Ignore handle cleanup errors
+            }
+            g_event_available = nullptr;
+        }
+        
+        // Clean up COM if we initialized it - but only if we're not in DLL unload
+        if (g_com_initialized.exchange(false)) {
+            try {
+                // Don't uninitialize COM during process shutdown - can cause crashes
+                // Just mark it as cleaned up
+                // CoUninitialize();
+            }
+            catch (...) {
+                // Ignore any COM cleanup errors
             }
         }
+        
+        g_last_error.clear();
     }
-    
-    // Clean up any remaining event sink (if the thread didn't finish cleanly)
-    if (g_event_sink) {
-        try {
-            g_event_sink->Cleanup();
-            delete g_event_sink;
-        }
-        catch (...) {
-            // Ignore cleanup errors
-        }
-        g_event_sink = nullptr;
+    catch (...) {
+        // Ignore all cleanup errors to prevent crashes during app shutdown
     }
-    
-    // Clear the queue
-    {
-        std::lock_guard<std::mutex> lock(g_queue_mutex);
-        while (!g_event_queue.empty()) {
-            g_event_queue.pop();
-        }
-    }
-    
-    // Clean up COM if we initialized it
-    if (g_com_initialized.exchange(false)) {
-        try {
-            CoUninitialize();
-        }
-        catch (...) {
-            // Ignore COM cleanup errors
-        }
-    }
-    
-    g_last_error.clear();
 }
 
 PROCESS_MONITOR_API const char* get_last_error()
