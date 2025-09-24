@@ -3,22 +3,22 @@ import 'dart:ffi';
 import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
-import 'package:flutter/foundation.dart';
 
-// C structures for FFI
+/// C structure for process event data, used for FFI with the native DLL.
 base class ProcessEventData extends Struct {
   @Array(32)
-  external Array<Uint8> _eventType;     // "start" or "stop"
-  
-  @Array(512)
-  external Array<Uint8> _processName;   // Process name
-  
-  @Int32()
-  external int processId;               // Process ID
-  
-  @Int64()
-  external int timestampMs;             // Timestamp in milliseconds since epoch
+  external Array<Uint8> _eventType; // "start" or "stop"
 
+  @Array(512)
+  external Array<Uint8> _processName; // Process name
+
+  @Int32()
+  external int processId; // Process ID
+
+  @Int64()
+  external int timestampMs; // Timestamp in milliseconds since epoch
+
+  /// Returns the process name as a Dart string.
   String get processName {
     final bytes = <int>[];
     for (int i = 0; i < 512; i++) {
@@ -29,6 +29,7 @@ base class ProcessEventData extends Struct {
     return String.fromCharCodes(bytes);
   }
 
+  /// Returns the event type ("start" or "stop") as a Dart string.
   String get eventType {
     final bytes = <int>[];
     for (int i = 0; i < 32; i++) {
@@ -78,65 +79,55 @@ typedef CleanupProcessMonitorDart = void Function();
 typedef GetLastErrorNative = Pointer<Utf8> Function();
 typedef GetLastErrorDart = Pointer<Utf8> Function();
 
+/// Represents a process event (start/stop) detected by the monitor.
 class ProcessEvent {
   final String processName;
   final int processId;
   final String eventType;
   final DateTime timestamp;
 
-  ProcessEvent({
-    required this.processName,
-    required this.processId,
-    required this.eventType,
-    required this.timestamp,
-  });
+  ProcessEvent({required this.processName, required this.processId, required this.eventType, required this.timestamp});
 
   @override
-  String toString() {
-    return 'ProcessEvent(processName: $processName, processId: $processId, eventType: $eventType, timestamp: $timestamp)';
-  }
+  String toString() => 'ProcessEvent(processName: $processName, processId: $processId, eventType: $eventType, timestamp: $timestamp)';
 }
 
 /// Configuration for monitoring a specific process
+///
+/// Used to specify which process to monitor, and what callbacks to run when it starts or stops.
 class ProcessConfig {
-  /// The name of the process to monitor (e.g., 'notepad.exe')
+  /// The name of the process to monitor
   final String processName;
-  
+
   /// Callback called when the process starts
   final void Function(ProcessEvent event)? onStart;
-  
+
   /// Callback called when the process stops
   final void Function(ProcessEvent event)? onStop;
-  
+
   /// Whether to call onStart callback for multiple instances of the same process
   /// If false, onStart is only called for the first instance
   final bool allowMultipleStartCallbacks;
-  
+
   /// Whether to call onStop callback for multiple instances of the same process
   /// If false, onStop is only called when the last instance stops
   final bool allowMultipleStopCallbacks;
 
-  ProcessConfig({
-    required this.processName,
-    this.onStart,
-    this.onStop,
-    this.allowMultipleStartCallbacks = true,
-    this.allowMultipleStopCallbacks = true,
-  });
+  ProcessConfig({required this.processName, this.onStart, this.onStop, this.allowMultipleStartCallbacks = true, this.allowMultipleStopCallbacks = true});
 
   @override
-  String toString() {
-    return 'ProcessConfig(processName: $processName, allowMultipleStart: $allowMultipleStartCallbacks, allowMultipleStop: $allowMultipleStopCallbacks)';
-  }
+  String toString() => 'ProcessConfig(processName: $processName, allowMultipleStart: $allowMultipleStartCallbacks, allowMultipleStop: $allowMultipleStopCallbacks)';
 }
 
+/// Main API for process monitoring.
+///
+/// Use [ProcessMonitor] to start/stop monitoring, listen to process events, and configure process-specific callbacks.
 class ProcessMonitor {
   static ProcessMonitor? _instance;
   static ProcessMonitor get instance => _instance ??= ProcessMonitor._();
 
   ProcessMonitor._();
-  
-  // Add factory constructor for backwards compatibility
+
   factory ProcessMonitor() => instance;
 
   DynamicLibrary? _lib;
@@ -159,38 +150,43 @@ class ProcessMonitor {
   // New fields for process-specific monitoring
   List<ProcessConfig>? _processConfigs;
   final Map<String, Set<int>> _runningProcesses = {}; // processName -> Set of PIDs
-  
+
   // Deduplication mechanism for events
   final Set<String> _recentEvents = {}; // Store recent event signatures to detect duplicates
-  static const int _eventDeduplicationWindowMs = 100; // 100ms window for deduplication
 
+  /// Stream of all process events.
   Stream<ProcessEvent> get events => _eventController.stream;
-  Stream<ProcessEvent> get processEvents => _eventController.stream; // Alias for compatibility
 
+  /// Whether the monitor is currently active.
   bool get isMonitoring {
     if (_isMonitoring == null) return _pollingTimer != null;
     return _isMonitoring!();
   }
 
+  /// Number of pending events in the native queue.
   int get pendingEventCount {
     if (_getPendingEventCount == null) return 0;
     return _getPendingEventCount!();
   }
 
+  /// Last error message from the native DLL, if any.
   String get lastError {
     if (_getLastError == null) return '';
     final errorPtr = _getLastError!();
+
     if (errorPtr == nullptr) return '';
     return errorPtr.toDartString();
   }
 
+  /// Initializes the native DLL and loads FFI function pointers.
+  /// Returns true if successful, false otherwise.
   bool initialize() {
     if (_isInitialized) return true;
 
     try {
-      // Try to load the FFI DLL - it should be in the same directory as the exe
+      // Try to load the FFI DLL
       const dllPath = 'process_monitor.dll';
-      
+
       _lib = DynamicLibrary.open(dllPath);
 
       // Load function pointers
@@ -207,87 +203,47 @@ class ProcessMonitor {
       // Initialize the native library
       final success = _initialize!();
       if (!success) {
-        print('Failed to initialize process monitor: ${lastError}');
+        print('Failed to initialize process monitor: $lastError');
         return false;
       }
 
       _isInitialized = true;
-      if (kDebugMode) {
-        print('ProcessMonitor initialized - FFI Mode');
-      }
       return true;
-
     } catch (e) {
-      if (kDebugMode) {
-        print('Failed to load FFI library: $e');
-        print('Running in test mode');
-      }
-      _isInitialized = true; // Still mark as initialized for test mode
-      return true;
+      print('Failed to load FFI library: $e');
+      return false;
     }
   }
 
+  /// Starts monitoring all processes (general mode).
+  /// Returns true if monitoring started successfully.
   Future<bool> startMonitoring() async {
-    if (kDebugMode) {
-      print('[DEBUG] ProcessMonitor.startMonitoring() called');
-    }
-    
     if (!_isInitialized && !initialize()) {
-      if (kDebugMode) {
-        print('[ERROR] Failed to initialize ProcessMonitor');
-      }
+      print('[ERROR] Failed to initialize ProcessMonitor');
       return false;
     }
 
     // Use event-driven monitoring (no polling!)
     if (_startMonitoring != null && _waitForEvents != null && _getAllEvents != null) {
-      if (kDebugMode) {
-        print('[DEBUG] Using event-driven monitoring (no polling)');
-        print('[DEBUG] Calling native start_monitoring()');
-      }
       final success = _startMonitoring!();
       if (!success) {
-        print('Failed to start monitoring: ${lastError}');
+        print('Failed to start monitoring: $lastError');
         return false;
-      }
-      if (kDebugMode) {
-        print('[DEBUG] Native start_monitoring() returned: $success');
       }
 
       // Start the event waiting in background isolate
       await _startBackgroundEventLoop();
-      
       return true;
     }
-
-    // Fall back to test mode
-    if (kDebugMode) {
-      print('[DEBUG] Falling back to test mode');
-    }
-    _startTestMode();
     return true;
   }
 
-  /// Start monitoring specific processes with individual callbacks
-  /// 
-  /// [processConfigs] - List of process configurations specifying which processes
-  ///                   to monitor and their respective callbacks
-  /// 
-  /// Returns true if monitoring started successfully
+  /// Start monitoring specific processes with individual callbacks.
+  ///
+  /// [processConfigs] - List of process configurations specifying which processes to monitor and their respective callbacks.
+  /// Returns true if monitoring started successfully.
   Future<bool> startMonitoringProcesses(List<ProcessConfig> processConfigs) async {
-    if (kDebugMode) {
-      print('[DEBUG] ProcessMonitor.startMonitoringProcesses() called with ${processConfigs.length} processes');
-      for (final config in processConfigs) {
-        print('[DEBUG] - Monitoring: ${config.processName}');
-      }
-    }
-
-    if (processConfigs.isEmpty) {
-      if (kDebugMode) {
-        print('[ERROR] No process configurations provided');
-      }
-      return false;
-    }
+    if (processConfigs.isEmpty) return false;
 
     // Store process configurations
     _processConfigs = processConfigs;
@@ -312,14 +268,12 @@ class ProcessMonitor {
     return true;
   }
 
+  /// Sets up process-specific event handling (internal).
   void _setupProcessSpecificEventHandling() {
     if (_processConfigs == null) return;
-
-    if (kDebugMode) {
-      print('[DEBUG] Setting up process-specific event handling for ${_processConfigs!.length} processes');
-    }
   }
 
+  /// Cleans up old event signatures from deduplication cache (internal).
   void _cleanupOldEventSignatures() {
     // In a production app, you might want to implement time-based cleanup
     // For now, just limit the size to prevent memory leaks
@@ -332,12 +286,9 @@ class ProcessMonitor {
     }
   }
 
+  /// Handles process-specific callbacks for a given event (internal).
   void _handleProcessSpecificEvent(ProcessEvent event) {
     if (_processConfigs == null) return;
-
-    if (kDebugMode) {
-      print('[DEBUG] _handleProcessSpecificEvent called for ${event.processName} ${event.eventType} PID:${event.processId}');
-    }
 
     // Find the process config for this event
     ProcessConfig? config;
@@ -348,13 +299,8 @@ class ProcessMonitor {
       }
     }
 
-    if (config == null) {
-      // Process not in our monitoring list, ignore
-      if (kDebugMode) {
-        print('[DEBUG] Process ${event.processName} not in monitoring list, ignoring');
-      }
-      return;
-    }
+    // If the process not in our monitoring list, ignore
+    if (config == null) return;
 
     final processName = config.processName;
     final processInstances = _runningProcesses[processName]!;
@@ -363,402 +309,218 @@ class ProcessMonitor {
       final wasEmpty = processInstances.isEmpty;
       processInstances.add(event.processId);
 
-      if (kDebugMode) {
-        print('[DEBUG] Process start: ${event.processName} PID:${event.processId}, wasEmpty:$wasEmpty, allowMultiple:${config.allowMultipleStartCallbacks}');
-      }
-
       // Call start callback based on configuration
       if (config.onStart != null) {
         if (config.allowMultipleStartCallbacks || wasEmpty) {
           try {
-            if (kDebugMode) {
-              print('[DEBUG] Calling onStart callback for ${event.processName} (PID: ${event.processId})');
-            }
             config.onStart!(event);
           } catch (e) {
-            if (kDebugMode) {
-              print('[ERROR] Error in onStart callback for ${event.processName}: $e');
-            }
+            print('[ERROR] Error in onStart callback for ${event.processName}: $e');
           }
         } else {
-          if (kDebugMode) {
-            print('[DEBUG] Skipped onStart callback for ${event.processName} (multiple instances not allowed, instances: ${processInstances.length})');
-          }
+          // Skipped due to configuration
         }
       }
     } else if (event.eventType == 'stop') {
       processInstances.remove(event.processId);
       final isEmpty = processInstances.isEmpty;
 
-      if (kDebugMode) {
-        print('[DEBUG] Process stop: ${event.processName} PID:${event.processId}, isEmpty:$isEmpty, allowMultiple:${config.allowMultipleStopCallbacks}');
-      }
-
       // Call stop callback based on configuration
       if (config.onStop != null) {
         if (config.allowMultipleStopCallbacks || isEmpty) {
           try {
-            if (kDebugMode) {
-              print('[DEBUG] Calling onStop callback for ${event.processName} (PID: ${event.processId})');
-            }
             config.onStop!(event);
           } catch (e) {
-            if (kDebugMode) {
-              print('[ERROR] Error in onStop callback for ${event.processName}: $e');
-            }
+            print('[ERROR] Error in onStop callback for ${event.processName}: $e');
           }
         } else {
-          if (kDebugMode) {
-            print('[DEBUG] Skipped onStop callback for ${event.processName} (multiple instances not allowed, remaining instances: ${processInstances.length})');
-          }
+          // Skipped due to configuration
         }
       }
     }
   }
 
+  /// Starts the background isolate that receives process events from the native DLL (internal).
   Future<void> _startBackgroundEventLoop() async {
-    if (kDebugMode) {
-      print('[DEBUG] Starting background event loop in isolate');
-    }
-    
     // Create a receive port to get events from the isolate
     _receivePort = ReceivePort();
-    
+
     // Listen to events from the background isolate
     _receivePort!.listen((data) {
       if (data is Map<String, dynamic>) {
         try {
-          final event = ProcessEvent(
-            processName: data['processName'] as String,
-            processId: data['processId'] as int,
-            eventType: data['eventType'] as String,
-            timestamp: DateTime.fromMillisecondsSinceEpoch(data['timestampMs'] as int),
-          );
-          
+          final event = ProcessEvent(processName: data['processName'] as String, processId: data['processId'] as int, eventType: data['eventType'] as String, timestamp: DateTime.fromMillisecondsSinceEpoch(data['timestampMs'] as int));
+
           // Create a unique signature for this event
           final eventSignature = '${event.eventType}-${event.processName}-${event.processId}-${event.timestamp.millisecondsSinceEpoch ~/ 1000}'; // Round to nearest second
-          
+
           // Check for duplicate events within the deduplication window
           if (_recentEvents.contains(eventSignature)) {
-            if (kDebugMode) {
-              print('[DEBUG] Duplicate event detected and ignored: ${event.eventType} - ${event.processName} (${event.processId})');
-            }
+            // Duplicate event, ignore
             return;
           }
-          
+
           // Add to recent events and clean up old entries
           _recentEvents.add(eventSignature);
           _cleanupOldEventSignatures();
-          
+
           // Handle process-specific callbacks if configured (only once)
-          if (_processConfigs != null) {
-            _handleProcessSpecificEvent(event);
-          }
-          
+          if (_processConfigs != null) _handleProcessSpecificEvent(event);
+
           // Always add to the general event stream for backward compatibility
-          if (!_eventController.isClosed) {
-            _eventController.add(event);
-          }
-          
-          if (kDebugMode) {
-            print('[DEBUG] Event received: ${event.eventType} - ${event.processName} (${event.processId})');
-          }
+          if (!_eventController.isClosed) _eventController.add(event);
         } catch (e) {
-          if (kDebugMode) {
-            print('[ERROR] Error processing event from isolate: $e');
-          }
+          print('[ERROR] Error processing event from isolate: $e');
         }
       } else if (data == 'stopped') {
-        if (kDebugMode) {
-          print('[DEBUG] Background event loop stopped');
-        }
+        // Isolate signaled it has stopped
       }
     });
-    
+
     // Start the background isolate
     try {
-      _backgroundIsolate = await Isolate.spawn(
-        _eventLoopIsolate,
-        _receivePort!.sendPort,
-      );
-      
-      if (kDebugMode) {
-        print('[DEBUG] Background isolate started successfully');
-      }
+      _backgroundIsolate = await Isolate.spawn(_eventLoopIsolate, _receivePort!.sendPort);
     } catch (e) {
-      if (kDebugMode) {
-        print('[ERROR] Failed to start background isolate: $e');
-      }
+      print('[ERROR] Failed to start background isolate: $e');
+
       _receivePort?.close();
       _receivePort = null;
     }
   }
 
   // Static method that runs in the background isolate
+  /// Background isolate entry point for receiving process events from the native DLL (internal).
   static void _eventLoopIsolate(SendPort sendPort) async {
-    if (kDebugMode) {
-      print('[DEBUG] Event loop isolate started');
-    }
-    
     // We need to reinitialize the DLL in this isolate
     DynamicLibrary? lib;
     WaitForEventsDart? waitForEvents;
     GetAllEventsDart? getAllEvents;
     IsMonitoringDart? isMonitoring;
-    
+
     try {
       // Load the DLL in this isolate
       const dllPath = 'process_monitor.dll';
       lib = DynamicLibrary.open(dllPath);
-      
+
       // Load the functions we need
       waitForEvents = lib.lookupFunction<WaitForEventsNative, WaitForEventsDart>('wait_for_events');
       getAllEvents = lib.lookupFunction<GetAllEventsNative, GetAllEventsDart>('get_all_events');
       isMonitoring = lib.lookupFunction<IsMonitoringNative, IsMonitoringDart>('is_monitoring');
-      
-      if (kDebugMode) {
-        print('[DEBUG] DLL loaded successfully in isolate');
-      }
     } catch (e) {
-      if (kDebugMode) {
-        print('[ERROR] Failed to load DLL in isolate: $e');
-      }
+      print('[ERROR] Failed to load DLL in isolate: $e');
       sendPort.send('stopped');
       return;
     }
-    
+
     // Event loop in background isolate
     while (true) {
       try {
         // Check if monitoring is still active
-        if (!isMonitoring()) {
-          if (kDebugMode) {
-            print('[DEBUG] Monitoring stopped, exiting isolate');
-          }
-          break;
-        }
-        
-        // Wait for events with 1 second timeout
-        final eventCount = waitForEvents(1000);
-        
+        if (!isMonitoring()) break;
+
+        // Wait for events with 500 milliseconds timeout
+        final eventCount = waitForEvents(500);
+
         if (eventCount > 0) {
           // Events available, fetch all of them
           const maxEvents = 100;
           final eventsArray = calloc<ProcessEventData>(maxEvents);
-          
+
           try {
             final actualCount = getAllEvents(eventsArray, maxEvents);
-            
+
             // Send all events to main isolate
             for (int i = 0; i < actualCount; i++) {
               final eventData = eventsArray.elementAt(i).ref;
-              
-              sendPort.send({
-                'processName': eventData.processName,
-                'processId': eventData.processId,
-                'eventType': eventData.eventType,
-                'timestampMs': eventData.timestampMs,
-              });
+
+              sendPort.send({'processName': eventData.processName, 'processId': eventData.processId, 'eventType': eventData.eventType, 'timestampMs': eventData.timestampMs});
             }
           } finally {
             calloc.free(eventsArray);
           }
         } else if (eventCount < 0) {
-          // Error occurred
-          if (kDebugMode) {
-            print('[DEBUG] Error waiting for events in isolate: $eventCount');
-          }
+          // This means an error has occurred
+          print('[DEBUG] Error waiting for events in isolate: $eventCount');
           break;
         }
-        // eventCount == 0 means timeout, which is normal
-        
+        // eventCount == 0 means timeout which is normal
       } catch (e) {
-        if (kDebugMode) {
-          print('[ERROR] Event loop isolate error: $e');
-        }
+        print('[ERROR] Event loop isolate error: $e');
         break;
       }
     }
-    
+
     sendPort.send('stopped');
-    if (kDebugMode) {
-      print('[DEBUG] Event loop isolate ended');
-    }
   }
 
-  void _startTestMode() {
-    if (kDebugMode) {
-      print('Starting test mode with fake events');
-    }
-    
-    _pollingTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
-      final events = [
-        ProcessEvent(
-          processName: 'notepad.exe',
-          processId: 1234,
-          eventType: 'start',
-          timestamp: DateTime.now(),
-        ),
-        ProcessEvent(
-          processName: 'calculator.exe',
-          processId: 5678,
-          eventType: 'start',
-          timestamp: DateTime.now(),
-        ),
-        ProcessEvent(
-          processName: 'notepad.exe',
-          processId: 1234,
-          eventType: 'stop',
-          timestamp: DateTime.now(),
-        ),
-      ];
-      
-      for (final event in events) {
-        // Create a unique signature for this event
-        final eventSignature = '${event.eventType}-${event.processName}-${event.processId}-${event.timestamp.millisecondsSinceEpoch ~/ 1000}';
-        
-        // Check for duplicate events within the deduplication window
-        if (_recentEvents.contains(eventSignature)) {
-          if (kDebugMode) {
-            print('[DEBUG] Duplicate test event detected and ignored: ${event.eventType} - ${event.processName} (${event.processId})');
-          }
-          continue;
-        }
-        
-        // Add to recent events and clean up old entries
-        _recentEvents.add(eventSignature);
-        _cleanupOldEventSignatures();
-        
-        // Handle process-specific callbacks if configured
-        if (_processConfigs != null) {
-          _handleProcessSpecificEvent(event);
-        }
-        
-        // Always add to the general event stream for backward compatibility
-        _eventController.add(event);
-      }
-    });
-  }
-
+  /// Stops process monitoring and cleans up resources.
+  /// Returns true if stopped successfully.
   Future<bool> stopMonitoring() async {
-    if (kDebugMode) {
-      print('[DEBUG] ProcessMonitor.stopMonitoring() called');
-    }
-    
     // Clear process-specific configurations
     _processConfigs = null;
     _runningProcesses.clear();
     _recentEvents.clear(); // Clear deduplication cache
-    
+
     try {
-      // Cancel timer immediately (fallback for polling mode)
-      if (kDebugMode) {
-        print('[DEBUG] Cancelling polling timer');
-      }
+      // Cancel timer immediately
       _pollingTimer?.cancel();
       _pollingTimer = null;
-      
+
       // Clean up background isolate
       if (_backgroundIsolate != null) {
-        if (kDebugMode) {
-          print('[DEBUG] Killing background isolate');
-        }
         _backgroundIsolate!.kill(priority: Isolate.immediate);
         _backgroundIsolate = null;
       }
-      
+
       // Clean up receive port
       if (_receivePort != null) {
-        if (kDebugMode) {
-          print('[DEBUG] Closing receive port');
-        }
         _receivePort!.close();
         _receivePort = null;
       }
 
       if (_stopMonitoring != null) {
-        if (kDebugMode) {
-          print('[DEBUG] Calling native stop_monitoring()');
-        }
         // Just call the native stop (which now only sets a flag)
         final success = _stopMonitoring!();
-        
-        if (!success) {
-          print('Failed to stop monitoring: ${lastError}');
-        }
-        
-        if (kDebugMode) {
-          print('[DEBUG] Native stop_monitoring() returned: $success');
-        }
-        
-        return success;
-      }
 
-      if (kDebugMode) {
-        print('[DEBUG] No native stop function available');
+        if (!success) print('Failed to stop monitoring: $lastError');
+        return success;
       }
       return true;
     } catch (e) {
-      if (kDebugMode) {
-        print('Exception during stop monitoring: $e');
-      }
-      return false;
+      print('Exception during stop monitoring: $e');
     }
+    return false;
   }
 
+  /// Disposes the monitor, stops monitoring, and releases all resources.
   Future<void> dispose() async {
     try {
-      if (kDebugMode) {
-        print('[DEBUG] ProcessMonitor.dispose() called');
-      }
-      
       // Clear process-specific configurations
       _processConfigs = null;
       _runningProcesses.clear();
-      
+
       // Stop monitoring immediately and synchronously
-      if (isMonitoring) {
-        if (kDebugMode) {
-          print('[DEBUG] Stopping monitoring during dispose');
-        }
-        await stopMonitoring();
-      }
-      
+      if (isMonitoring) await stopMonitoring();
+
       // Cancel timer immediately
       _pollingTimer?.cancel();
       _pollingTimer = null;
-      
+
       // Close event controller immediately
-      if (!_eventController.isClosed) {
-        _eventController.close();
-      }
-      
+      if (!_eventController.isClosed) _eventController.close();
+
       // Cleanup the native library immediately
       if (_cleanup != null) {
         try {
-          if (kDebugMode) {
-            print('[DEBUG] Calling native cleanup during dispose');
-          }
           _cleanup!();
-          if (kDebugMode) {
-            print('[DEBUG] Native cleanup completed');
-          }
         } catch (e) {
-          if (kDebugMode) {
-            print('Error during native cleanup: $e');
-          }
+          print('Error during native cleanup: $e');
         }
       }
-      
+
       _isInitialized = false;
-      
-      if (kDebugMode) {
-        print('[DEBUG] ProcessMonitor.dispose() completed');
-      }
     } catch (e) {
-      if (kDebugMode) {
-        print('Error during dispose: $e');
-      }
+      print('Error during dispose: $e');
     }
   }
 }

@@ -1,6 +1,6 @@
 name: process_monitor
 description: "A Flutter plugin to monitor when system processes get created or terminated on Windows using FFI."
-version: 0.0.1
+version: 0.1.0
 homepage:
 
 environment:
